@@ -3,6 +3,7 @@
 # Copyright (c) 2020 Patrick Esser and Robin Rombach and Björn Ommer. All Rights Reserved.
 # ------------------------------------------------------------------------------------
 
+from random import random
 from omegaconf import OmegaConf
 from typing import Optional, Tuple
 
@@ -12,6 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .layers import *
+from .diffaug import DiffAugment
 
 
 class DummyLoss(nn.Module):
@@ -23,7 +25,9 @@ class VQLPIPS(nn.Module):
     def __init__(self, codebook_weight: float = 1.0,
                  loglaplace_weight: float = 1.0,
                  loggaussian_weight: float = 1.0,
-                 perceptual_weight: float = 1.0) -> None:
+                 perceptual_weight: float = 1.0,
+                 aug_prob: float = 0.0,
+                 aug_policy: str = 'color, translation, cutout') -> None:
         
         super().__init__()
         self.perceptual_loss = lpips.LPIPS(net="vgg", verbose=False)
@@ -31,13 +35,15 @@ class VQLPIPS(nn.Module):
         self.codebook_weight = codebook_weight 
         self.loglaplace_weight = loglaplace_weight 
         self.loggaussian_weight = loggaussian_weight
-        self.perceptual_weight = perceptual_weight 
+        self.perceptual_weight = perceptual_weight
+
+        self.aug_prob = aug_prob
+        self.aug_policy = aug_policy
 
     def forward(self, codebook_loss: torch.FloatTensor, inputs: torch.FloatTensor, reconstructions: torch.FloatTensor, optimizer_idx: int,
                 global_step: int, batch_idx: int, last_layer: Optional[nn.Module] = None, split: Optional[str] = "train") -> Tuple:
-        inputs = inputs.contiguous()
-        reconstructions = reconstructions.contiguous()       
-
+        inputs, reconstructions = DiffAugment(inputs, reconstructions, policy=self.aug_policy if random() < self.aug_prob else '')
+        
         loglaplace_loss = (reconstructions - inputs).abs().mean()
         loggaussian_loss = (reconstructions - inputs).pow(2).mean()
         perceptual_loss = self.perceptual_loss(inputs*2-1, reconstructions*2-1).mean()
@@ -66,8 +72,11 @@ class VQLPIPSWithDiscriminator(nn.Module):
                  perceptual_weight: float = 1.0,
                  adversarial_weight: float = 1.0,
                  use_adaptive_adv: bool = True,
+                 adative_max: float = 1e4,
                  r1_gamma: float = 10,
-                 do_r1_every: int = 16) -> None:
+                 do_r1_every: int = 16,
+                 aug_prob: float = 1.0,
+                 aug_policy: str = 'color, translation, cutout') -> None:
         
         super().__init__()
         assert disc_loss in ["hinge", "vanilla", "least_square"], f"Unknown GAN loss '{disc_loss}'."
@@ -89,8 +98,11 @@ class VQLPIPSWithDiscriminator(nn.Module):
 
         self.adversarial_weight = adversarial_weight
         self.use_adaptive_adv = use_adaptive_adv
+        self.adative_max = adative_max
         self.r1_gamma = r1_gamma
         self.do_r1_every = do_r1_every
+        self.aug_prob = aug_prob
+        self.aug_policy = aug_policy
 
     def calculate_adaptive_factor(self, nll_loss: torch.FloatTensor,
                                   g_loss: torch.FloatTensor, last_layer: nn.Module) -> torch.FloatTensor:
@@ -98,14 +110,15 @@ class VQLPIPSWithDiscriminator(nn.Module):
         g_grads = torch.autograd.grad(g_loss, last_layer, retain_graph=True)[0]
         
         adapt_factor = torch.norm(nll_grads) / (torch.norm(g_grads) + 1e-4)
-        adapt_factor = adapt_factor.clamp(0.0, 1e4).detach()
+        adapt_factor = adapt_factor.clamp(0.0, self.adative_max).detach()
 
         return adapt_factor
 
     def forward(self, codebook_loss: torch.FloatTensor, inputs: torch.FloatTensor, reconstructions: torch.FloatTensor, optimizer_idx: int,
                 global_step: int, batch_idx: int, last_layer: Optional[nn.Module] = None, split: Optional[str] = "train") -> Tuple:
-        inputs = inputs.contiguous()
-        reconstructions = reconstructions.contiguous()       
+        disc_factor = 1 if global_step >= self.discriminator_iter_start else 0
+        do_r1 = self.training and bool(disc_factor) and batch_idx % self.do_r1_every == 0
+        inputs, reconstructions = DiffAugment(inputs.requires_grad_(do_r1), reconstructions, policy=self.aug_policy if random() < self.aug_prob else '')       
         
         # now the GAN part
         if optimizer_idx == 0:
@@ -128,7 +141,6 @@ class VQLPIPSWithDiscriminator(nn.Module):
                 assert not self.training
                 d_weight = torch.tensor(0.0)
 
-            disc_factor = 1 if global_step >= self.discriminator_iter_start else 0
             loss = nll_loss + disc_factor * d_weight * g_loss + self.codebook_weight * codebook_loss
 
             log = {"{}/total_loss".format(split): loss.clone().detach(),
@@ -147,10 +159,7 @@ class VQLPIPSWithDiscriminator(nn.Module):
 
         if optimizer_idx == 1:
             # second pass for discriminator update
-            disc_factor = 1 if global_step >= self.discriminator_iter_start else 0
-            do_r1 = self.training and bool(disc_factor) and batch_idx % self.do_r1_every == 0
-
-            logits_real = self.discriminator(inputs.requires_grad_(do_r1))
+            logits_real = self.discriminator(inputs)
             logits_fake = self.discriminator(reconstructions.detach())
             
             d_loss = disc_factor * self.disc_loss(logits_fake, logits_real)
@@ -161,7 +170,7 @@ class VQLPIPSWithDiscriminator(nn.Module):
                 gradients_norm = gradients.norm(2, dim=1).pow(2).mean()
                 d_loss += self.r1_gamma * self.do_r1_every * gradients_norm/2
 
-            log = {"{}/disc_loss".format(split): d_loss.detach(),
+            log = {"{}/disc_loss".format(split): d_loss.clone().detach(),
                    "{}/logits_real".format(split): logits_real.detach().mean(),
                    "{}/logits_fake".format(split): logits_fake.detach().mean(),
                    }
